@@ -1,0 +1,383 @@
+---
+title: "LOGRESC_RUN_MODEL"
+output:
+  html_document:
+    editor_options: null
+    smart: no
+  pdf_document: default
+  chunk_output_type: inline
+---
+Load Libraries:
+```{r message=F, warning=F}
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(mapdata)
+library(tinytex)
+library(sjstats)
+library("maptools")
+library("raster")
+library("DescTools")
+library("fitdistrplus")
+library(gridExtra)
+library(GISTools)
+library(rgdal)
+library(rio)
+memory.limit(size=50000)
+```
+1. Initialize the shpfile for the tests and calculate fields: 
+```{r}
+calc <- readOGR(dsn="C:/Users/jtoland/Desktop/Haywired/R", layer="calc")
+```
+2. Set Model Parameters for Testing
+```{r}
+#Restoration Times for Power from scneario, defualted at Haywired
+
+P_POWER_S <- 1
+P_POWER_M <- .97
+P_POWER_E <- .7 #this fast recovery of power may have a major effect .65 only is 1.8 million
+P_POWER_c <- .61 #.2 we have 1.4 Million on day 1 and t <3 and 800K for T = 3 from hazus + PGE **FIT
+
+#defualt Shakout IS (1,1,.95,.49,.04)  HAZUS defualt  esitmate is (1,1,.5,.13.04) the range tthat matches HayWIred at Day 3 power restoration porjections is (1, .95, .8,.5). I HAVE TAKEN THESE FROM THE VOL 3 HAZUS ESTIMATES THE FINAL UMBER SARE (1,1,.95,.7,.61)
+
+#Bridge complete damage mean from NBI analysis
+P_BRIDGE_C <- 1.2
+
+# Road and Rail upper limit or mean e.g. 1 vs. 2 ***DECIDED***
+P_RR_C <- 2 
+
+#Pipes EMBUD upper limit for the SD from the epirical curve for small pipes 1, PERFECT, 
+P_PIPES_SD <- .85
+P_PIPES_MEAN <- .25 #this is the truw value. We can likely go to .28 may .22 min
+DUCTILE <- .70553564 #DUCTIL PROOPORTIONAL WEIGTEING FOR intial pipe damage im the areas without impact for the PORTER fragility function. THIS ONE IS  CORRECT 
+
+#sovi scaling for the caluclagtion, from calc$normalized
+
+
+qScale <- .0944685 # the SD from the new algorithm calculation ***DECIDED***
+cScale <- .064375
+
+# export file
+afile <- "calc_final.dbf"
+```
+3. Run LOGRESC Model
+```{r}
+calc <-as.data.frame(calc)
+calc <- calc %>% mutate(POWER_S = plnorm(calc$PGA, meanlog = log(.15), sdlog = .6))
+calc <- calc %>% mutate(POWER_M = plnorm(calc$PGA, meanlog = log(.25), sdlog = .5))
+calc <- calc %>% mutate(POWER_E = plnorm(calc$PGA, meanlog = log(.35), sdlog = .4))
+calc <- calc %>% mutate(POWER_C = plnorm(calc$PGA, meanlog = log(.7), sdlog = .4))
+
+#Now we calcualte the expected power damage probability
+
+calc <- calc %>% mutate(POWER_DAMAGE = 1-((1- calc$POWER_S) + P_POWER_S*(calc$POWER_S - calc$POWER_M)+ P_POWER_M*( calc$POWER_M - calc$POWER_E) + P_POWER_E*(calc$POWER_E - calc$POWER_C) + P_POWER_c* calc$POWER_C))
+
+#Calculate BRIDGE_DAMAGE
+
+calc <- calc %>% mutate(BRIDGE_C = plnorm(calc$SA10, meanlog = log(P_BRIDGE_C), sdlog = .6))
+
+#Road and Rail Damage
+
+calc <- calc %>% mutate(ROAD_C = plnorm((P_RR_C*calc$L_PROB*calc$L_SETTLEM), meanlog = log(60), sdlog = .7))
+calc <- calc %>% mutate(RAIL_C = plnorm((P_RR_C*calc$L_PROB*calc$L_SETTLEM), meanlog = log(24), sdlog = .7))
+
+#Calculate Water pipe conveyance damage
+
+calc <- calc %>% mutate(PIPE_DAMAGE = pnorm(log(calc$BREAK_R), mean = log(P_PIPES_MEAN), sd = P_PIPES_SD))
+
+# calculate the hazard maximum ENTROPY DISTIRBUTION
+
+calc_h <- calc[, c("POWER_DAMAGE", "PIPE_DAMAGE", "RAIL_C", "BRIDGE_C", "ROAD_C")]
+calc$HAZARD_DAMAGE <- as.vector(apply(X=calc_h, MARGIN=1, FUN=max))
+
+#calculate the quantiles
+
+percentilerank<-function(x){
+  rx<-rle(sort(x))
+  smaller<-cumsum(c(0, rx$lengths))[seq(length(rx$lengths))]
+  larger<-rev(cumsum(c(0, rev(rx$lengths))))[-1]
+  rxpr<-smaller/(smaller+larger)
+  rxpr[match(x, rx$values)]
+}
+
+#change to SCORE here for SOVI 10-14 or SOVI0610CA for sovi 06-10
+
+calc <- calc %>% mutate(normalized = (calc$SOVI0610CA - min(calc$SOVI0610CA))/(max(calc$SOVI0610CA)- min(calc$SOVI0610CA)))
+
+calc$Indicators[calc$Indicators == 999999] <- 0 #for 
+
+calc <- calc %>% mutate(normalized_c = (calc$Indicators - min(calc$Indicators))/(10- min(calc$Indicators)))
+
+calc$quantiles<-percentilerank(calc$normalized)
+calc$quantiles[calc$quantiles==0]<- .000001
+calc$quantiles[calc$quantiles==1]<- .999999
+
+calc$quantiles_c <-percentilerank(calc$normalized_c)
+calc$quantiles_c[calc$quantiles_c==0]<- .000001
+calc$quantiles_c[calc$quantiles_c==1]<- .999999
+
+calc <- calc %>% mutate(M = abs(calc$HAZARD_DAMAGE - 1))
+calc <- calc %>% mutate(m = abs(calc$HAZARD_DAMAGE))
+calc_h <- calc[, c("M", "m")]
+calc$num <- as.vector(apply(X=calc_h, MARGIN=1, FUN=min))
+calc$denom <- as.vector(apply(X=calc_h, MARGIN=1, FUN=max))
+
+#calclate the maximum hazard risk probabiltiiy
+
+calc <- calc %>% mutate(RISK_p = qnorm(calc$quantiles, mean = calc$HAZARD_DAMAGE, sd = qScale*calc$num/calc$denom)) #*sd(calc$qfactor)
+
+calc <- calc %>% mutate(RISK_POP = floor(calc$RISK_p*calc$POP)) #floor round
+
+sum(calc$RISK_POP)
+#calc$HAZARD_DAMAGE <- calc$POWER_DAMAGE #for tesing here
+##calc <- calc %>% mutate(RISK_POP = floor(calc$HAZARD_DAMAGE*calc$POP)) # for testing power
+#sum(calc$RISK_POP) # for testing power
+```
+THIS IS THE CORE RESOURCE REQUIREMENTS OVER TIME CODE
+```{r}
+
+#these must be revised with the new ratios as the nested means  !!!INCOMPLETE!!! from errors
+calc$PARAM_A_A[calc$HAZARD_DAMAGE >= 0.3872915] <- -0.0278 #for 
+calc$PARAM_A_A[calc$HAZARD_DAMAGE >= 0.1161102 & calc$HAZARD_DAMAGE < 0.3872915] <- -0.061 #for 
+calc$PARAM_A_A[calc$HAZARD_DAMAGE >= 0.0205085 & calc$HAZARD_DAMAGE < 0.1161102 ] <- -0.36 #for SVI
+calc$PARAM_A_A[calc$HAZARD_DAMAGE < 0.0205085] <- -25.3 #for SVI
+
+calc$PARAM_A_B[calc$HAZARD_DAMAGE >= 0.3872915] <- 284 #for SVI
+calc$PARAM_A_B[calc$HAZARD_DAMAGE >= 0.1161102 & calc$HAZARD_DAMAGE < 0.3872915] <- 129  #for SVI
+calc$PARAM_A_B[calc$HAZARD_DAMAGE >= 0.0205085 & calc$HAZARD_DAMAGE < 0.1161102 ] <- 22  #for SVI
+calc$PARAM_A_B[calc$HAZARD_DAMAGE < 0.0205085] <- .2 #for SVI
+
+calc$PARAM_A_C[calc$HAZARD_DAMAGE >= 0.3872915] <- 284 #for SVI
+calc$PARAM_A_C[calc$HAZARD_DAMAGE >= 0.1161102 & calc$HAZARD_DAMAGE < 0.3872915] <- 129 #for SVI
+calc$PARAM_A_C[calc$HAZARD_DAMAGE >= 0.0205085 & calc$HAZARD_DAMAGE < 0.1161102 ] <- 22 #for SVI
+calc$PARAM_A_C[calc$HAZARD_DAMAGE < 0.0205085] <- .2 #for SVI
+
+#THESE NEED TO BE RECALCULATED--only the fitted parts on right these are going to be for (2,23,132,287)
+```
+SCENARIO A
+```{r}
+calc <- calc %>% mutate(x_7_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(7-3)))) # for testing power
+calc <- calc %>% mutate(x_14_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(14-3)))) # for testing power
+calc <- calc %>% mutate(x_30_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(30-3)))) # for testing power
+calc <- calc %>% mutate(x_45_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(45-3)))) # for testing power
+calc <- calc %>% mutate(x_60_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(60-3)))) # for testing power
+calc <- calc %>% mutate(x_90_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(90-3)))) # for testing power
+calc <- calc %>% mutate(x_120_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(120-3)))) # for testing power
+calc <- calc %>% mutate(x_180_A = floor(calc$RISK_POP*exp(calc$PARAM_A_A*(180-3)))) # for testing power
+
+```
+SCENARIO C
+```{r}
+calc <- calc %>% mutate(x_7_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(7-3))+ calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_14_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(14-3))+ calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_30_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(30-3))+ calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_45_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(45-3))+ calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_60_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(60-3))+ calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_90_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(90-3))+ calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_120_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(120-3))+ calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_180_C = floor((-1)*exp((log(calc$RISK_POP)/(calc$PARAM_A_C*1))*(180-3))+ calc$RISK_POP)) # for testing power
+```
+SCENARIO B
+```{r}
+calc <- calc %>% mutate(x_7_B = floor((((-1)*calc$RISK_POP*(7-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_14_B = floor((((-1)*calc$RISK_POP*(14-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_30_B = floor((((-1)*calc$RISK_POP*(30-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_45_B = floor((((-1)*calc$RISK_POP*(45-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_60_B = floor((((-1)*calc$RISK_POP*(60-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_90_B = floor((((-1)*calc$RISK_POP*(90-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing power
+calc <- calc %>% mutate(x_120_B = floor((((-1)*calc$RISK_POP*(120-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing
+calc <- calc %>% mutate(x_180_B = floor((((-1)*calc$RISK_POP*(180-3))/calc$PARAM_A_B) + calc$RISK_POP)) # for testing
+```
+
+```{r}
+
+calc$quantiles_c[calc$quantiles_c <= 0.02778677] <- 0.02778677 # this doesnt work
+regglm <- as.data.frame(calc)
+ggplot(data = calc) +
+geom_density(aes(x = calc$normalized_c), color = 'black', fill = 'gray', kernel = "gaussian", bw=.1,  adjust = 2.5) +
+
+ggtitle("Approximation of Sovi with Normal") +
+stat_function(fun = dnorm, args = list(mean = mean(calc$normalized_c) , sd = sd(calc$normalized_c)), colour = "red") +
+theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+calc$x_7_A[calc$x_7_A < 0] <- 0 #for OUT OF RANGE
+calc$x_14_A[calc$x_14_A < 0] <- 0 #for for OUT OF RANGE
+calc$x_30_A[calc$x_30_A < 0] <- 0 #for for OUT OF RANGE
+calc$x_45_A[calc$x_45_A < 0] <- 0 #for for OUT OF RANGE
+calc$x_60_A[calc$x_60_A < 0] <- 0 #for for OUT OF RANGE
+calc$x_90_A[calc$x_90_A < 0] <- 0 #for for OUT OF RANGE
+calc$x_120_A[calc$x_120_A < 0] <- 0 #for for OUT OF RANGE
+calc$x_180_A[calc$x_180_A < 0] <- 0 #for for OUT OF RANGE
+
+
+calc$x_7_B[calc$x_7_B < 0] <- 0 #for OUT OF RANGE
+calc$x_14_B[calc$x_14_B < 0] <- 0 #for for OUT OF RANGE
+calc$x_30_B[calc$x_30_B < 0] <- 0 #for for OUT OF RANGE
+calc$x_45_B[calc$x_45_B < 0] <- 0 #for for OUT OF RANGE
+calc$x_60_B[calc$x_60_B < 0] <- 0 #for for OUT OF RANGE
+calc$x_90_B[calc$x_90_B < 0] <- 0 #for for OUT OF RANGE
+calc$x_120_B[calc$x_120_B < 0] <- 0 #for for OUT OF RANGE
+calc$x_180_B[calc$x_180_B < 0] <- 0 #for for OUT OF RANGE
+
+calc$x_7_C[calc$x_7_C < 0] <- 0 #for OUT OF RANGE
+calc$x_14_C[calc$x_14_C < 0] <- 0 #for for OUT OF RANGE
+calc$x_30_C[calc$x_30_C < 0] <- 0 #for for OUT OF RANGE
+calc$x_45_C[calc$x_45_C < 0] <- 0 #for for OUT OF RANGE
+calc$x_60_C[calc$x_60_C < 0] <- 0 #for for OUT OF RANGE
+calc$x_90_C[calc$x_90_C < 0] <- 0 #for for OUT OF RANGE
+calc$x_120_C[calc$x_120_C < 0] <- 0 #for for OUT OF RANGE
+calc$x_180_C[calc$x_180_C < 0] <- 0 #for for OUT OF RANGE
+
+sum(calc$x_7_A)
+sum(calc$x_14_A)
+sum(calc$x_30_A)
+sum(calc$x_45_A)
+sum(calc$x_60_A)
+sum(calc$x_90_A)
+sum(calc$x_120_A)
+sum(calc$x_180_A)
+
+sum(calc$x_7_B)
+sum(calc$x_14_B)
+sum(calc$x_30_B)
+sum(calc$x_45_B)
+sum(calc$x_60_B)
+sum(calc$x_90_B)
+sum(calc$x_120_B)
+sum(calc$x_180_B)
+
+sum(calc$x_7_C)
+sum(calc$x_14_C)
+sum(calc$x_30_C)
+sum(calc$x_45_C)
+sum(calc$x_60_C)
+sum(calc$x_90_C)
+sum(calc$x_120_C)
+sum(calc$x_180_C)
+```
+
+AMPLIFY BY CVI
+```{r}
+#STILL WORKIGN ON THIS THE LASTTHING but it hink this is it
+
+calc <- calc %>% mutate(RX_7_A = floor(qnorm(calc$quantiles, mean = calc$x_7_A, sd = qScale*calc$x_7_A)))
+calc <- calc %>% mutate(RX_14_A = floor(qnorm(calc$quantiles, mean = calc$x_14_A, sd = qScale*calc$x_14_A)))
+calc <- calc %>% mutate(RX_30_A = floor(qnorm(calc$quantiles, mean = calc$x_30_A, sd = qScale*calc$x_30_A)))
+calc <- calc %>% mutate(RX_45_A = floor(qnorm(calc$quantiles, mean = calc$x_45_A, sd = qScale*calc$x_45_A)))
+calc <- calc %>% mutate(RX_60_A = floor(qnorm(calc$quantiles, mean = calc$x_60_A, sd = qScale*calc$x_60_A)))
+calc <- calc %>% mutate(RX_90_A = floor(qnorm(calc$quantiles, mean = calc$x_90_A, sd = qScale*calc$x_90_A)))
+calc <- calc %>% mutate(RX_120_A = floor(qnorm(calc$quantiles, mean = calc$x_120_A, sd = qScale*calc$x_120_A)))
+calc <- calc %>% mutate(RX_180_A = floor(qnorm(calc$quantiles, mean = calc$x_180_A, sd = qScale*calc$x_180_A)))
+
+calc <- calc %>% mutate(RX_7_B = floor(qnorm(calc$quantiles, mean = calc$x_7_B, sd = qScale*calc$x_7_B)))
+calc <- calc %>% mutate(RX_14_B = floor(qnorm(calc$quantiles, mean = calc$x_14_B, sd = qScale*calc$x_14_B)))
+calc <- calc %>% mutate(RX_30_B = floor(qnorm(calc$quantiles, mean = calc$x_30_B, sd = qScale*calc$x_30_B)))
+calc <- calc %>% mutate(RX_45_B = floor(qnorm(calc$quantiles, mean = calc$x_45_B, sd = qScale*calc$x_45_B)))
+calc <- calc %>% mutate(RX_60_B = floor(qnorm(calc$quantiles, mean = calc$x_60_B, sd = qScale*calc$x_60_B)))
+calc <- calc %>% mutate(RX_90_B = floor(qnorm(calc$quantiles, mean = calc$x_90_B, sd = qScale*calc$x_90_B)))
+calc <- calc %>% mutate(RX_120_B = floor(qnorm(calc$quantiles, mean = calc$x_120_B, sd = qScale*calc$x_120_B)))
+calc <- calc %>% mutate(RX_180_B = floor(qnorm(calc$quantiles, mean = calc$x_180_B, sd = qScale*calc$x_180_B)))
+
+
+calc <- calc %>% mutate(RX_7_C = floor(qnorm(calc$quantiles, mean = calc$x_7_C, sd = qScale*calc$x_7_C)))
+calc <- calc %>% mutate(RX_14_C = floor(qnorm(calc$quantiles, mean = calc$x_14_C, sd = qScale*calc$x_14_C)))
+calc <- calc %>% mutate(RX_30_C = floor(qnorm(calc$quantiles, mean = calc$x_30_C, sd = qScale*calc$x_30_C)))
+calc <- calc %>% mutate(RX_45_C = floor(qnorm(calc$quantiles, mean = calc$x_45_C, sd = qScale*calc$x_45_C)))
+calc <- calc %>% mutate(RX_60_C = floor(qnorm(calc$quantiles, mean = calc$x_60_C, sd = qScale*calc$x_60_C)))
+calc <- calc %>% mutate(RX_90_C = floor(qnorm(calc$quantiles, mean = calc$x_90_C, sd = qScale*calc$x_90_C)))
+calc <- calc %>% mutate(RX_120_C = floor(qnorm(calc$quantiles, mean = calc$x_120_C, sd = qScale*calc$x_120_C)))
+calc <- calc %>% mutate(RX_180_C = floor(qnorm(calc$quantiles, mean = calc$x_180_C, sd = qScale*calc$x_180_C)))
+
+
+sum(calc$RX_7_A)
+sum(calc$RX_14_A)
+sum(calc$RX_30_A)
+sum(calc$RX_45_A)
+sum(calc$RX_60_A)
+sum(calc$RX_90_A)
+sum(calc$RX_120_A)
+sum(calc$RX_180_A)
+
+sum(calc$RX_7_B)
+sum(calc$RX_14_B)
+sum(calc$RX_30_B)
+sum(calc$RX_45_B)
+sum(calc$RX_60_B)
+sum(calc$RX_90_B)
+sum(calc$RX_120_B)
+sum(calc$RX_180_B)
+
+sum(calc$RX_7_C)
+sum(calc$RX_14_C)
+sum(calc$RX_30_C)
+sum(calc$RX_45_C)
+sum(calc$RX_60_C)
+sum(calc$RX_90_C)
+sum(calc$RX_120_C)
+sum(calc$RX_180_C)
+```
+
+```{r}
+export(calc[,c("KEY","X_COORD","Y_COORD","POWER_DAMAGE","BRIDGE_C","RAIL_C","ROAD_C","PIPE_DAMAGE","HAZARD_DAMAGE", "RISK_p","RISK_POP","RX_7_A","RX_14_A","RX_30_A","RX_45_A","RX_60_A","RX_90_A","RX_7_B","RX_14_B","RX_30_B","RX_45_B","RX_60_B","RX_90_B","RX_7_C","RX_14_C","RX_30_C","RX_45_C","RX_60_C","RX_90_C","POP","RX_120_A","RX_180_A","RX_120_B","RX_180_B","RX_120_C","RX_180_C")], afile, format = "dbf")
+```
+
+```{r}
+#LOAD THE LIBRAIRIES FOR TESTING
+#yrm(list=ls())
+library("spatstat")
+library("knitr")
+library("rgdal")
+library("maptools")
+library("raster")
+library("ape")
+library("spatial")
+library("sp")
+library("maps")
+library("rgeos")
+library("spdep")
+library("lattice")
+library("spgwr")
+library("ResourceSelection")
+library("pscl")
+library("BaylorEdPsych")
+library("sperrorest")
+library("pROC")
+library("caret")
+library("fitdistrplus")
+library("logspline")
+library("vcd")
+library("tseries")
+library("DescTools")
+library("mctest")
+library("ggplot2")
+library("betareg")
+library("lmtest")
+library("rcompanion")
+library("modEvA")
+library("rsq")
+library("gamlss")
+library("AICcmodavg”)
+```
+
+
+```{r}
+#THESE ARE THE Histograms AND EMPIRICAL DISTRIBUTIONS OF THE DATA. This is a basic density plot histogram.  It looks close to a Poisson distribution but the mean and std dev are not the same, so it is not.  So it is a beta distribution, as this really useful Cullen and Frey graph test shows below.  I have also allowed for both discrete and continuous models of the data. I WILL INCLUDE THE FOUR PANEL GRAPH IN CHAPTER 5, as this is the true distribution of the results of the probabilistic risk model!
+hist(calc$HAZARD_DAMAGE, breaks=25)
+#curve(dbeta(regglm$CALC,  0.1391879, 1.2605410), add = TRUE)
+plotdist(calc$HAZARD_DAMAGE, histo = TRUE, demp = TRUE)
+descdist(calc$HAZARD_DAMAGE, boot = 500, discrete = FALSE)
+
+#fittesta <- fitdist(regglm$CALC,"pois", method = "mme")
+#plot(fittesta)
+#summary(fittesta)
+
+# plotting the beta curve with the distribution is an exact fit, as expected.  This curve is very flexible.
+fittestb <- fitdist(calc$HAZARD_DAMAGE,"beta", method = "mme")
+plot(fittestb)
+summary(fittestb)
+
+sd(calc$HAZARD_DAMAGE)
+mean(calc$HAZARD_DAMAGE)
+```
